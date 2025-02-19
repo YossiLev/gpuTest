@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU FFT Demo</title>
+</head>
+<body>
+    <h2>WebGPU FFT Demo</h2>
+    <button onclick="runFFT()">Run FFT</button>
+    <p id="output">Execution Time: - ms</p>
+
+    <script type="module">
+        async function runFFT() {
+
+            if (!navigator.gpu) {
+                alert("WebGPU is not supported in your browser.");
+                return;
+            }
+
+            const adapter = await navigator.gpu.requestAdapter();
+            const device = await adapter.requestDevice();
+
+            const N = 1024;
+            const logN = Math.log2(N);
+            const realPart = new Float32Array(N).fill(0.1);
+            const imagPart = new Float32Array(N).fill(0.0);
+            const debugPart = new Float32Array(10).fill(10.0);
+
+            function createBuffer(array, usage) {
+                const buffer = device.createBuffer({
+                    size: array.byteLength,
+                    usage: usage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+                    mappedAtCreation: true,
+                });
+                new Float32Array(buffer.getMappedRange()).set(array);
+                buffer.unmap();
+                return buffer;
+            }
+
+            const realBuffer = createBuffer(realPart, GPUBufferUsage.STORAGE);
+            const imagBuffer = createBuffer(imagPart, GPUBufferUsage.STORAGE);
+            const debugBuffer = createBuffer(debugPart, GPUBufferUsage.STORAGE);
+
+            device.queue.writeBuffer(realBuffer, 0, realPart);
+            device.queue.writeBuffer(imagBuffer, 0, imagPart);
+            device.queue.writeBuffer(debugBuffer, 0, debugPart);
+
+            const uniformBuffer = device.createBuffer({
+                size: 8,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([N, logN]));
+
+            const shaderModule = device.createShaderModule({
+                code: `
+                    @group(0) @binding(0) var<storage, read_write> real : array<f32>;
+                    @group(0) @binding(1) var<storage, read_write> imag : array<f32>;
+                    @group(0) @binding(2) var<storage, read_write> debug : array<f32>;
+                    @group(0) @binding(3) var<uniform> params : vec2<u32>;
+
+                    @compute @workgroup_size(64)
+                    fn fftPass(@builtin(global_invocation_id) id : vec3<u32>) {
+                        let i = id.x;
+                        let N = params.x;
+                        let logN = params.y;
+
+                        for (var step = 1u; step < 6u/*logN*/; step++) {
+                            let m = 1u << step;
+                            let halfM = m >> 1;
+
+                            let an = f32(m) / f32(N);
+                            let angle = -6.28318530718 * an;
+                            let wr = cos(angle);
+                            let wi = sin(angle);
+                            if (abs(wr) > 1.1 || abs(wi) > 1.1) {
+                                debug[0] = 100.0;
+                                debug[1] = angle;
+                                debug[2] = wr;
+                                debug[3] = wi;
+                            }
+
+                            for (var j = i; j < N - halfM; j += m) {
+                                let k = j + halfM;
+
+                                let treal = wr * real[k] - wi * imag[k];
+                                let timag = wr * imag[k] + wi * real[k];
+
+                                real[k] = real[j] - treal;
+                                imag[k] = imag[j] - timag;
+                                real[j] = real[j] + treal;
+                                imag[j] = imag[j] + timag;
+                            }
+                        }
+                    }
+                `,
+            });
+
+            const fftPipeline = device.createComputePipeline({
+                layout: "auto",
+                compute: { module: shaderModule, entryPoint: "fftPass" },
+            });
+
+            const bindGroup = device.createBindGroup({
+                layout: fftPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: realBuffer } },
+                    { binding: 1, resource: { buffer: imagBuffer } },
+                    { binding: 2, resource: { buffer: debugBuffer } },
+                    { binding: 3, resource: { buffer: uniformBuffer } },
+                ],
+            });
+
+            const startTime = performance.now();
+
+            const commandEncoder = device.createCommandEncoder();
+
+            const passEncoder = commandEncoder.beginComputePass();
+            passEncoder.setPipeline(fftPipeline);
+            passEncoder.setBindGroup(0, bindGroup);
+            passEncoder.dispatchWorkgroups(N / 64);
+            passEncoder.end();
+
+            device.queue.submit([commandEncoder.finish()]);
+            const endTime = performance.now();
+            document.getElementById("output").innerText = `Execution Time: ${(endTime - startTime).toFixed(2)} ms`;
+
+            const gpuReadBuffer = device.createBuffer({
+                size: realPart.byteLength,
+                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            });
+
+            const copyEncoder = device.createCommandEncoder();
+            copyEncoder.copyBufferToBuffer(realBuffer, 0, gpuReadBuffer, 0, realPart.byteLength);
+            device.queue.submit([copyEncoder.finish()]);
+
+            await gpuReadBuffer.mapAsync(GPUMapMode.READ);
+            const realOutput = new Float32Array(gpuReadBuffer.getMappedRange());
+            console.log("FFT Real Output:", realOutput);
+            var array = Array.prototype.slice.call(realOutput);
+            console.log("FFT array:", array);
+            gpuReadBuffer.unmap();
+
+
+            const gpuDebugBuffer = device.createBuffer({
+                size: debugPart.byteLength,
+                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            });
+
+            const copyEncoder2 = device.createCommandEncoder();
+            copyEncoder2.copyBufferToBuffer(debugBuffer, 0, gpuDebugBuffer, 0, debugPart.byteLength);
+            device.queue.submit([copyEncoder2.finish()]);
+
+            await gpuDebugBuffer.mapAsync(GPUMapMode.READ);
+            const debugOutput = new Float32Array(gpuDebugBuffer.getMappedRange());
+            var arrayDebug = Array.prototype.slice.call(debugOutput);
+            console.log("FFT debug:", arrayDebug);
+            gpuDebugBuffer.unmap();
+        }
+
+        // Expose function to global scope so button works
+        window.runFFT = runFFT;
+    </script>
+</body>
+</html>
