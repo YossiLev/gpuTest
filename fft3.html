@@ -4,13 +4,21 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WebGPU FFT</title>
+    <script src="fourier.js"></script>
 </head>
 <body>
     <button id="runFFT">Run FFT</button>
+    <p id="outputC"></p>
     <p id="output"></p>
 
     <script>
         async function runFFT() {
+            for (let r = 0; r < 1;r++) {
+                runFFTX();
+            }
+        }
+        async function runFFTX() {
+
             if (!navigator.gpu) {
                 alert("WebGPU not supported on this browser.");
                 return;
@@ -23,8 +31,20 @@
             const logN = Math.log2(N);
 
             // Create buffers for real and imaginary parts
-            const realArray = new Float32Array(N).fill(0.0);
+            const realArray = new Float32Array(N).fill(1.0);
             const imagArray = new Float32Array(N).fill(0.0);
+            for (let i = 0; i < realArray.length; i++) {
+                realArray[i] = Math.random();
+                imagArray[i] = Math.random();
+            }
+
+            let startTime = performance.now();
+
+            let [cpuReal, cpuImag] = fft(realArray, imagArray);
+
+            let endTime = performance.now();
+            console.log("CPU FFT Real Output:", cpuReal);
+            document.getElementById("outputC").textContent = `CPU FFT Done in ${0.001 * (endTime - startTime).toFixed(9)} s`;
 
             const realBuffer = device.createBuffer({
                 size: realArray.byteLength,
@@ -52,19 +72,16 @@
                     @group(0) @binding(1) var<storage, read_write> imag : array<f32>;
                     @group(0) @binding(2) var<uniform> params : vec2<u32>;
 
-                    @compute @workgroup_size(64)
+                    @compute @workgroup_size(128)
                     fn fftPass(@builtin(global_invocation_id) id : vec3<u32>) {
-                        let threadID = id.x;
+                        let j = id.x;
                         let step = params.x;
-                        let N = params.y;
 
-                        let m = 1u << (step + 1); 
-                        let halfM = m >> 1;
-
-                        let j = threadID; 
+                        let halfM = 1u << step;
+                        let m = halfM << 1; 
 
                         if ((j & halfM) == 0) {
-                            let angle = -6.28318530718 / f32(m);
+                            let angle = 6.28318530718 / f32(m) * f32(j);
                             let wr = cos(angle);
                             let wi = sin(angle);
 
@@ -99,23 +116,24 @@
                 ]
             });
 
-            const commandEncoder = device.createCommandEncoder();
-            const startTime = performance.now();
+            startTime = performance.now();
 
             for (let step = 0; step < logN; step++) {
                 device.queue.writeBuffer(paramBuffer, 0, new Uint32Array([step, N]));
 
+                const commandEncoder = device.createCommandEncoder();
                 const passEncoder = commandEncoder.beginComputePass();
                 passEncoder.setPipeline(pipeline);
                 passEncoder.setBindGroup(0, bindGroup);
-                passEncoder.dispatchWorkgroups(N / 2 / 64); // 512 threads per step
+                passEncoder.dispatchWorkgroups(N / 128);
                 passEncoder.end();
+
+                device.queue.submit([commandEncoder.finish()]);
+
+                // Wait for the GPU to finish before moving to the next step
+                await device.queue.onSubmittedWorkDone();
             }
-
-            device.queue.submit([commandEncoder.finish()]);
-
-            await device.queue.onSubmittedWorkDone();
-            const endTime = performance.now();
+            endTime = performance.now();
 
             // Read back results
             const resultBuffer = device.createBuffer({
@@ -131,8 +149,8 @@
             const result = new Float32Array(resultBuffer.getMappedRange()).slice();
             resultBuffer.unmap();
 
-            document.getElementById("output").textContent = `FFT Done in ${(endTime - startTime).toFixed(2)} ms`;
-            console.log("FFT Real Output:", result);
+            document.getElementById("output").textContent = `GPU FFT Done in ${0.001 * (endTime - startTime).toFixed(9)} s`;
+            console.log("GPU FFT Real Output:", result);
         }
 
         document.getElementById("runFFT").addEventListener("click", runFFT);

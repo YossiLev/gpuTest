@@ -123,7 +123,7 @@
 
             device.queue.submit([commandEncoder.finish()]);
             const endTime = performance.now();
-            document.getElementById("output").innerText = `Execution Time: ${(endTime - startTime).toFixed(2)} ms`;
+            document.getElementById("output").innerText = `Execution Time: ${(0.001 * (endTime - startTime)).toFixed(9)} s`;
 
             const gpuReadBuffer = device.createBuffer({
                 size: realPart.byteLength,

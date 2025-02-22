@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GPU FFT with WebGPU</title>
+</head>
+<body>
+    <script type="module">
+        class GPUFFT {
+            async init() {
+                if (!navigator.gpu) {
+                    throw new Error('WebGPU not supported');
+                }
+
+                this.adapter = await navigator.gpu.requestAdapter();
+                if (!this.adapter) {
+                    throw new Error('No GPU adapter found');
+                }
+
+                this.device = await this.adapter.requestDevice();
+                this.setupPipeline();
+            }
+
+            setupPipeline() {
+                // Shader module with WGSL (WebGPU Shading Language)
+                const shaderCode = `
+                    struct Complex {
+                        real: f32,
+                        imag: f32,
+                    }
+
+                    @group(0) @binding(0) var<storage, read> inputBuffer : array<Complex>;
+                    @group(0) @binding(1) var<storage, read_write> outputBuffer : array<Complex>;
+                    @group(0) @binding(2) var<uniform> params : vec2<f32>; // size, stage
+
+                    fn complexMult(a: Complex, b: Complex) -> Complex {
+                        return Complex(
+                            a.real * b.real - a.imag * b.imag,
+                            a.real * b.imag + a.imag * b.real
+                        );
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn fft(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let size = u32(params.x);
+                        let stage = u32(params.y);
+                        let index = id.x;
+
+                        if (index >= size) {
+                            return;
+                        }
+
+                        let p = 1u << stage;
+                        let k = index & (p - 1u);
+                        let pair = index ^ p;
+                        let PI = 3.14159265359;
+
+                        if (pair < index) {
+                            return;
+                        }
+
+                        let input1 = inputBuffer[index];
+                        let input2 = inputBuffer[pair];
+                        let angle = - 2.0 * PI * f32(k) / f32(size >> stage);
+                        let twiddle = Complex(cos(angle), sin(angle));
+
+                        let result1 = Complex(
+                            input1.real + twiddle.real * input2.real - twiddle.imag * input2.imag,
+                            input1.imag + twiddle.real * input2.imag + twiddle.imag * input2.real
+                        );
+                        let result2 = Complex(
+                            input1.real - twiddle.real * input2.real + twiddle.imag * input2.imag,
+                            input1.imag - twiddle.real * input2.imag - twiddle.imag * input2.real
+                        );
+
+                        outputBuffer[index] = result1;
+                        outputBuffer[pair] = result2;
+                    }
+                `;
+
+                this.pipeline = this.device.createComputePipeline({
+                    layout: 'auto',
+                    compute: {
+                        module: this.device.createShaderModule({ code: shaderCode }),
+                        entryPoint: 'fft'
+                    }
+                });
+
+                this.bindGroupLayout = this.pipeline.getBindGroupLayout(0);
+            }
+
+            async computeFFT(inputData, size) {
+                if (!this.device) await this.init();
+
+                // Create buffers
+                const inputBuffer = this.device.createBuffer({
+                    size: size * 8, // 2 floats (real, imag) per complex number
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                    mappedAtCreation: true
+                });
+                new Float32Array(inputBuffer.getMappedRange()).set(inputData);
+                inputBuffer.unmap();
+
+                const outputBuffer = this.device.createBuffer({
+                    size: size * 8,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+                });
+
+                const uniformBuffer = this.device.createBuffer({
+                    size: 8, // 2 floats for size and stage
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+                });
+
+                // Bit-reverse input for FFT
+                const bitReversedInput = new Float32Array(inputData);
+                for (let i = 0; i < 1; i++) {
+                    let rev = 0;
+                    for (let j = 0; j < Math.log2(size); j++) {
+                        rev = (rev << 1) | ((i >> j) & 1);
+                    }
+                    if (rev > i) {
+                        [bitReversedInput[i*2], bitReversedInput[rev*2]] = 
+                        [bitReversedInput[rev*2], bitReversedInput[i*2]];
+                        [bitReversedInput[i*2+1], bitReversedInput[rev*2+1]] = 
+                        [bitReversedInput[rev*2+1], bitReversedInput[i*2+1]];
+                    }
+                }
+                this.device.queue.writeBuffer(inputBuffer, 0, bitReversedInput);
+
+                // Perform FFT stages
+                const stages = Math.log2(size);
+                for (let stage = 0; stage < stages; stage++) {
+                    this.device.queue.writeBuffer(uniformBuffer, 0, new Float32Array([size, stage]));
+
+                    const bindGroup = this.device.createBindGroup({
+                        layout: this.bindGroupLayout,
+                        entries: [
+                            { binding: 0, resource: { buffer: inputBuffer } },
+                            { binding: 1, resource: { buffer: outputBuffer } },
+                            { binding: 2, resource: { buffer: uniformBuffer } }
+                        ]
+                    });
+
+                    const commandEncoder = this.device.createCommandEncoder();
+                    const pass = commandEncoder.beginComputePass();
+                    pass.setPipeline(this.pipeline);
+                    pass.setBindGroup(0, bindGroup);
+                    pass.dispatchWorkgroups(Math.ceil(size / 64));
+                    pass.end();
+
+                    commandEncoder.copyBufferToBuffer(outputBuffer, 0, inputBuffer, 0, size * 8);
+                    this.device.queue.submit([commandEncoder.finish()]);
+
+                    //await this.device.queue.onSubmittedWorkDone();
+
+                }
+
+                // Read results
+                const resultBuffer = this.device.createBuffer({
+                    size: size * 8,
+                    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+                });
+
+                const commandEncoder = this.device.createCommandEncoder();
+                commandEncoder.copyBufferToBuffer(outputBuffer, 0, resultBuffer, 0, size * 8);
+                this.device.queue.submit([commandEncoder.finish()]);
+
+                await resultBuffer.mapAsync(GPUMapMode.READ);
+                const resultArray = new Float32Array(resultBuffer.getMappedRange());
+                const complexResult = Array.from({ length: size }, (_, i) => ({
+                    real: resultArray[i * 2],
+                    imag: resultArray[i * 2 + 1]
+                }));
+
+                // Cleanup
+                resultBuffer.unmap();
+                inputBuffer.destroy();
+                outputBuffer.destroy();
+                uniformBuffer.destroy();
+                resultBuffer.destroy();
+
+                return complexResult;
+            }
+        }
+
+        async function runDemo() {
+            try {
+                const fft = new GPUFFT();
+                await fft.init();
+
+                const size = 1 << 20;
+                const inputData = new Float32Array(size * 2);
+                for (let i = 0; i < size; i++) {
+                    inputData[i * 2] = 1.0;//Math.sin(i * Math.PI / 4); // Real part
+                    inputData[i * 2 + 1] = 0;                     // Imaginary part
+                }
+
+                console.log('Input:');
+                for (let i = 0; i < Math.min(size, 10); i++) {
+                    console.log(`${i}: ${inputData[i*2].toFixed(3)} + ${inputData[i*2+1].toFixed(3)}i`);
+                }
+
+                let startTime = performance.now();
+
+                const result = await fft.computeFFT(inputData, size);
+
+                let endTime = performance.now();
+
+                console.log(`GPU FFT Done in ${0.001 * (endTime - startTime).toFixed(9)} s`);
+
+                console.log('\nFFT Result:');
+                for (let i = 0; i < Math.min(size, 10); i++) {
+                    console.log(`${i}: ${result[i].real.toFixed(3)} + ${result[i].imag.toFixed(3)}i`);
+                }
+            } catch (e) {
+                console.error('Error:', e.message);
+            }
+        }
+
+        runDemo();
+    </script>
+</body>
+</html>
