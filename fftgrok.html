@@ -16,7 +16,12 @@
                     throw new Error('No GPU adapter found');
                 }
 
-                this.device = await this.adapter.requestDevice();
+                this.device = await this.adapter.requestDevice({
+                    requiredLimits: {
+                        maxComputeWorkgroupSizeX: 1024,  // Request 1024 threads per workgroup
+                        maxComputeInvocationsPerWorkgroup: 1024 // Allow 1024 total invocations
+                    }
+                });
                 this.setupPipeline();
             }
 
@@ -39,7 +44,7 @@
                         );
                     }
 
-                    @compute @workgroup_size(64)
+                    @compute @workgroup_size(1024)
                     fn fft(@builtin(global_invocation_id) id: vec3<u32>) {
                         let size = u32(params.x);
                         let stage = u32(params.y);
@@ -144,7 +149,7 @@
                     const pass = commandEncoder.beginComputePass();
                     pass.setPipeline(this.pipeline);
                     pass.setBindGroup(0, bindGroup);
-                    pass.dispatchWorkgroups(Math.ceil(size / 64));
+                    pass.dispatchWorkgroups(Math.ceil(size / 1024));
                     pass.end();
 
                     commandEncoder.copyBufferToBuffer(outputBuffer, 0, inputBuffer, 0, size * 8);
